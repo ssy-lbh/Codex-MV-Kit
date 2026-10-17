@@ -75,6 +75,10 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
+    # JSON and diagnostics use UTF-8 even when Windows redirects a legacy code page.
+    for stream in (sys.stdout, sys.stderr):
+        if callable(getattr(stream, "reconfigure", None)):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     args = parser().parse_args(argv)
     try:
         from .archive import pack_project, restore_archive, verify_archive
@@ -102,7 +106,8 @@ def main(argv=None) -> int:
             if args.command == "doctor":
                 emit({"version": __version__, "python": sys.version.split()[0],
                       "ffmpeg": tools.ffmpeg, "ffprobe": tools.ffprobe,
-                      "ffmpeg_version": subprocess.check_output([tools.ffmpeg, "-version"], text=True).splitlines()[0]})
+                      "ffmpeg_version": subprocess.check_output([tools.ffmpeg, "-version"], text=True, encoding="utf-8", errors="replace").splitlines()[0],
+                      "ffprobe_version": subprocess.check_output([tools.ffprobe, "-version"], text=True, encoding="utf-8", errors="replace").splitlines()[0]})
             elif args.command == "probe":
                 emit(probe(args.input, tools))
             elif args.command == "analyze-audio":

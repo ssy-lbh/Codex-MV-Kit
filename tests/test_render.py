@@ -1,10 +1,15 @@
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
+import time
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 import wave
 
 import numpy as np
@@ -53,6 +58,109 @@ class CompositionTests(unittest.TestCase):
         sprite.putalpha(128)
         _place(canvas, sprite, {"effect": "negative"}, state)
         self.assertEqual(canvas.getpixel((16, 16)), (225, 195, 165, 128))
+
+
+class EncoderShutdownTests(unittest.TestCase):
+    def test_failed_render_drains_wrapper_child_before_temp_cleanup(self):
+        self._check_wrapper_failure(hang=False)
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-tree fallback")
+    def test_unresponsive_windows_wrapper_child_is_stopped_with_parent(self):
+        self._check_wrapper_failure(hang=True)
+
+    def _check_wrapper_failure(self, *, hang):
+        # Reproduce an executable shim: its child inherits encoder.log, then
+        # needs time after stdin EOF to release that handle and exit.
+        real_popen = subprocess.Popen
+        with tempfile.TemporaryDirectory(prefix="mv_encoder_wrapper_test_") as temporary:
+            root = Path(temporary)
+            ready, done = root / "child-ready", root / "child-done"
+            child = root / "child.py"
+            child.write_text(
+                "import os, sys, time\nfrom pathlib import Path\n"
+                "ready = Path(sys.argv[1])\n"
+                "ready.with_suffix('.tmp').write_text(str(os.getpid()), encoding='ascii')\n"
+                "ready.with_suffix('.tmp').replace(ready)\n"
+                "sys.stdin.buffer.read()\n"
+                f"time.sleep({60 if hang else 0.3})\n"
+                "Path(sys.argv[2]).write_text('EOF drained', encoding='ascii')\n",
+                encoding="utf-8",
+            )
+            wrapper = root / "wrapper.py"
+            wrapper.write_text(
+                "import subprocess, sys\n"
+                "child = subprocess.Popen([sys.executable, '-u', *sys.argv[1:]])\n"
+                "raise SystemExit(child.wait())\n",
+                encoding="utf-8",
+            )
+            project = root / "project.json"
+            project.write_text(json.dumps(project_fixture()), encoding="utf-8")
+            (root / "red.png").write_bytes(b"intentionally corrupt PNG")
+            Image.new("RGBA", (8, 8), "blue").save(root / "blue.png")
+            processes, work_dirs, child_handles = [], [], []
+
+            def launch_wrapper(command, **kwargs):
+                if command[0] != "fixture":
+                    return real_popen(command, **kwargs)
+                work_dirs.append(Path(kwargs["cwd"]))
+                process = real_popen([sys.executable, "-u", str(wrapper), str(child), str(ready), str(done)], **kwargs)
+                processes.append(process)
+                deadline = time.monotonic() + 5
+                while not ready.exists():
+                    if process.poll() is not None or time.monotonic() >= deadline:
+                        raise RuntimeError("Encoder wrapper child did not start")
+                    time.sleep(0.01)
+                if hang:
+                    import ctypes
+                    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+                    kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+                    kernel.OpenProcess.restype = ctypes.c_void_p
+                    handle = kernel.OpenProcess(0x00100000, False, int(ready.read_text(encoding="ascii")))
+                    if not handle:
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    child_handles.append((kernel, handle))
+                return process
+
+            try:
+                with patch("codex_mv.render.subprocess.Popen", side_effect=launch_wrapper), \
+                        patch("codex_mv.render._ENCODER_EOF_TIMEOUT", 0.1 if hang else 5.0):
+                    with self.assertRaisesRegex(MediaError, "Cannot decode image asset red"):
+                        render_project(project, root / "failed.mp4",
+                                       toolchain=SimpleNamespace(ffmpeg="fixture", ffprobe="fixture"))
+                self.assertEqual(len(processes), 1)
+                if hang:
+                    import ctypes
+                    kernel, handle = child_handles[0]
+                    kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+                    kernel.WaitForSingleObject.restype = ctypes.c_uint32
+                    self.assertEqual(kernel.WaitForSingleObject(handle, 3000), 0)
+                    self.assertIsNotNone(processes[0].returncode)
+                    self.assertFalse(done.exists())
+                else:
+                    self.assertEqual(processes[0].returncode, 0)
+                    self.assertEqual(done.read_text(encoding="ascii"), "EOF drained")
+                self.assertFalse(work_dirs[0].exists())
+                self.assertFalse((root / "failed.mp4").exists())
+            finally:
+                # Keep the fixture leak-free even when run against the old
+                # implementation, which kills the wrapper before its child.
+                for process in processes:
+                    if process.stdin is not None and not process.stdin.closed:
+                        process.stdin.close()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=3)
+                if not hang:
+                    deadline = time.monotonic() + 5
+                    while ready.exists() and not done.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                for kernel, handle in child_handles:
+                    import ctypes
+                    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+                    kernel.CloseHandle.restype = ctypes.c_int
+                    kernel.CloseHandle(handle)
 
 
 class SyntheticRenderTests(unittest.TestCase):

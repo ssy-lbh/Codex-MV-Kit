@@ -5,10 +5,14 @@ permissions:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
         python: ['3.11', '3.12']
     runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,6 +25,10 @@ jobs:
         if: runner.os == 'Windows'
         run: choco install ffmpeg --no-progress -y
       - run: python -m pip install -e .
+      - name: Show media tools and Python dependencies
+        run: |
+          python -m codex_mv doctor
+          python -m pip freeze
       - run: python -m unittest discover -s tests -v
       - run: python scripts/check_release.py
       - run: python scripts/smoke_demo.py --workdir workspace/ci-smoke

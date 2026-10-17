@@ -8,8 +8,10 @@ from fractions import Fraction
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import tempfile
 import wave
@@ -21,6 +23,8 @@ from .project import ProjectError, load_project, resolve_relative
 
 
 _PROPERTIES = ("x", "y", "scale", "rotation", "opacity")
+_ENCODER_EOF_TIMEOUT = 5.0
+_ENCODER_STOP_TIMEOUT = 3.0
 
 
 def _frame_count(duration, fps):
@@ -120,6 +124,38 @@ def _baked_video_in_window(project, start, end):
     return False
 
 
+def _stop_encoder_tree(encoder, *, force=False):
+    """Stop the owned encoder and wrappers without leaving their children running."""
+    if os.name == "nt":
+        # A package-manager shim can own FFmpeg, which also inherits stderr.
+        result = subprocess.run(["taskkill", "/PID", str(encoder.pid), "/T", "/F"],
+                                capture_output=True, timeout=_ENCODER_STOP_TIMEOUT,
+                                creationflags=subprocess.CREATE_NO_WINDOW)
+        if result.returncode and encoder.poll() is None:
+            detail = result.stderr.decode("mbcs", errors="replace").strip()
+            raise MediaError(f"Cannot stop encoder process tree: {detail}")
+    else:
+        try:
+            os.killpg(encoder.pid, signal.SIGKILL if force else signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
+def _finish_failed_encoder(encoder):
+    """Give EOF a bounded chance to drain through wrappers before stopping them."""
+    try:
+        encoder.wait(timeout=_ENCODER_EOF_TIMEOUT)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    _stop_encoder_tree(encoder)
+    try:
+        encoder.wait(timeout=_ENCODER_STOP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        _stop_encoder_tree(encoder, force=True)
+        encoder.wait(timeout=_ENCODER_STOP_TIMEOUT)
+
+
 def _encode_frames(project, root, work, chain, start, count, hashes, video_samples):
     width, height = project["canvas"]["width"], project["canvas"]["height"]
     fps = project["fps"]
@@ -137,8 +173,11 @@ def _encode_frames(project, root, work, chain, start, count, hashes, video_sampl
         error_file = work / "encoder.log"
         with error_file.open("wb") as error_log:
             try:
+                process_options = ({"creationflags": subprocess.CREATE_NO_WINDOW}
+                                   if os.name == "nt" else {"start_new_session": True})
                 encoder = subprocess.Popen(command, cwd=work, stdin=subprocess.PIPE,
-                                           stdout=subprocess.DEVNULL, stderr=error_log)
+                                           stdout=subprocess.DEVNULL, stderr=error_log,
+                                           **process_options)
             except OSError as exc:
                 raise MediaError(f"Cannot start FFmpeg: {exc}") from exc
             try:
@@ -197,9 +236,11 @@ def _encode_frames(project, root, work, chain, start, count, hashes, video_sampl
                     encoder.stdin.close()
                 except (BrokenPipeError, OSError):
                     pass
-                if encoder.poll() is None:
-                    encoder.terminate()
-                encoder.wait()
+                try:
+                    _finish_failed_encoder(encoder)
+                except (OSError, subprocess.SubprocessError, MediaError) as cleanup_error:
+                    exc.add_note(f"Encoder process cleanup failed: {cleanup_error}")
+                    raise exc from cleanup_error
                 if isinstance(exc, BrokenPipeError):
                     raise MediaError(f"FFmpeg stopped reading frames: {error_file.read_text(encoding='utf-8', errors='replace')[-6000:]}") from exc
                 raise

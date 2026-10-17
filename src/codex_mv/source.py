@@ -10,12 +10,25 @@ from .archive import file_sha256
 from .media import MediaError, Toolchain, probe
 
 
+def _run(command: list[str], operation: str) -> subprocess.CompletedProcess:
+    """Preserve media-tool diagnostics instead of an opaque process exit code."""
+    try:
+        result = subprocess.run(command, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise MediaError(f"{operation}: {exc}") from exc
+    if result.returncode:
+        details = result.stderr.strip()[-6000:] or "No diagnostic output"
+        raise MediaError(f"{operation} (exit {result.returncode}): {details}")
+    return result
+
+
 def native_frame_table(path: str | Path, toolchain: Toolchain | None = None) -> list[dict[str, Any]]:
     tools = toolchain or Toolchain()
-    result = subprocess.run([tools.ffprobe, "-v", "error", "-select_streams", "v:0",
-                             "-show_frames", "-show_entries",
-                             "frame=pts,best_effort_timestamp,best_effort_timestamp_time",
-                             "-of", "json", str(path)], capture_output=True, check=True)
+    result = _run([tools.ffprobe, "-v", "error", "-select_streams", "v:0",
+                   "-show_frames", "-show_entries",
+                   "frame=pts,best_effort_timestamp,best_effort_timestamp_time",
+                   "-of", "json", str(path)], f"FFprobe native-frame inspection failed for {path}")
     rows = []
     for index, frame in enumerate(json.loads(result.stdout).get("frames", [])):
         if "best_effort_timestamp_time" not in frame:
@@ -48,10 +61,13 @@ def extract_frame(path: str | Path, output: str | Path, *, time: float | None = 
             raise ValueError("Requested frame index is outside the native timeline")
         row = rows[index]
     output.parent.mkdir(parents=True, exist_ok=True)
+    # One selected native frame needs no frame-rate conversion. Avoid both the
+    # removed -vsync option and -fps_mode, which older FFmpeg builds lack.
     command = [tools.ffmpeg, "-v", "error", "-n", "-noautorotate", "-i", str(path),
                "-map", "0:v:0", "-an", "-sn", "-dn", "-vf",
-               f"select=eq(n\\,{row['index']})", "-vsync", "0", "-frames:v", "1", str(output)]
-    subprocess.run(command, check=True, capture_output=True)
+               f"select=eq(n\\,{row['index']})", "-frames:v", "1",
+               "-f", "image2", "-update", "1", str(output)]
+    _run(command, f"FFmpeg native-frame extraction failed for {path}")
     stream = next(s for s in probe(path, tools)["streams"] if s["codec_type"] == "video")
     report = {"source_file": str(path), "source_sha256": file_sha256(path),
               "requested_time": time, "requested_index": index,

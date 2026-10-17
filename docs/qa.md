@@ -83,3 +83,11 @@ python -m codex_mv compare-audio workspace/first-demo/assets/clicks.wav workspac
 逐 pose 检查整身、手指、腕部连接、肩胯透视、脚底基线与身份。实际动作观察跳帧、切换抖动和镜像误作转身。角色重叠时检查所有前后关系；白线稿仍需完整 alpha 遮挡，不能让后方身体从前方躯干内部透出。
 
 用最终分辨率检查透明边缘和线条，再正常速度完整播放。对照短片保留相同时间范围和镜头，避免只挑更有利的一帧。若审片尚未完成，在交付报告里写 `visual_review: pending` 并列出未检事项。归档和所有自动测试通过都不能替你将它改成 `pass`。
+
+## Windows 与 FFmpeg 版本兼容
+
+单张 native 帧按索引选择后，只输出一张 image2 图片，不依赖旧 `-vsync` 或较新 `-fps_mode` 参数。FFprobe / FFmpeg 出错时保留 stderr，不能只报告退出码。
+
+Windows 的包管理器可能通过 shim 启动真正的 FFmpeg。渲染异常时先关闭输入并有界等待它退出；必要时停止本次创建的进程树，再清理临时文件。只结束 shim 可能留下子进程占用日志，掩盖原始素材错误。不能通过忽略清理错误或跳过失败测试解决这个问题。
+
+CLI 的 JSON 与错误信息统一使用 UTF-8，重定向输出和旧 Windows 代码页也应保留中文路径。CI 独立执行四个系统/Python组合，并显示实际工具及依赖版本；一个失败不取消其他组合，所有检查仍需通过。
